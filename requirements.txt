@@ -1,0 +1,7 @@
+mcp[cli]>=1.0
+pandas
+streamlit
+plotly
+curl_cffi             # optional: price cache refresh (Yahoo chart endpoint)
+wealthsimple-python   # optional: unofficial API ingestion
+keyring               # optional: persists WS OAuth tokens across runs

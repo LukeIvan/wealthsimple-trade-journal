@@ -1,0 +1,10 @@
+.claude/agent-memory
+.claude/settings.local.json
+__pycache__
+.vscode
+.DS_Store
+.venv
+sample_data
+.env
+.env.local
+.env.test
