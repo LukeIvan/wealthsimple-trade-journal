@@ -1,4 +1,4 @@
-## WS Trade Journal
+## WS Trade Journal + MCP
 
 A self-hosted trade journal + analytics + MCP server for Wealthsimple
 self-directed accounts. Everything flows through one SQLite database, so each
