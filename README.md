@@ -36,6 +36,12 @@ source .venv/bin/activate   # or prefix commands with `uv run`
 price cache and API ingestion respectively. CSV ingestion, the dashboard,
 and the MCP server work without them.
 
+You can then run
+```bash
+streamlit run dashboard.py
+```
+Once you've followed the below initial ingestion steps, you can use the 'Data Controls' box at the bottom of the UI to run price ingestion and data ingestion from your account. Automating that, TBD.
+
 ## Environment variables & credentials
 
 **No API keys or tokens are required.** The full credential picture:
