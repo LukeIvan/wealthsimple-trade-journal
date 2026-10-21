@@ -159,10 +159,10 @@ re-entry buys the move missed or avoided while flat.
 
 ## 4. MCP server (let agents analyze your trading)
 
-The MCP server exposes the journal to AI clients as six tools:
+The MCP server exposes the journal to AI clients as seven tools:
 `journal_list_trades`, `journal_get_positions`, `journal_pnl_summary`,
-`journal_list_options`, `journal_symbol_history`, `journal_add_note`.
-All are read-only except
+`journal_list_options`, `journal_symbol_history`, `journal_list_income`,
+`journal_add_note`. All are read-only except
 `journal_add_note`, which lets an agent write insights back into your journal
 (attributed `author='agent'`, visible in the dashboard). There is
 intentionally no order placement, no raw SQL, and no credential access in the
@@ -212,6 +212,105 @@ The `env` block is only needed if you moved the DB with `WSJ_DB_PATH`.
 - "Which symbols have I traded at the worst win rate?"
 - "Which of my loss sales might trigger the superficial-loss rule?"
 
+## 5. Claude subagent (`trading-performance-analyst`)
+
+The MCP server gives an agent *access* to the journal. The subagent in
+`.claude/agents/trading-performance-analyst.md` gives it *expertise*: an
+analyst persona with this project's conventions baked in, so it doesn't make
+the classic mistakes — double-subtracting FX drag from P&L, treating option
+premium as per-share, assuming ACB is complete on positions that arrived by
+transfer, or reporting an assumed-worthless contract as fact.
+
+It's checked into the repo, so Claude Code discovers it automatically when run
+from this directory. Nothing to install beyond a connected MCP server.
+
+### Prerequisites
+
+1. Data ingested (section 1) and prices cached (section 2). The agent is
+   read-only: it will **not** run an ingest for you — it detects stale data
+   and tells you to run one.
+2. The `ws-journal` MCP server connected (section 4) — `claude mcp list`
+   should show `✔ Connected`. Without it the agent has no data source and
+   will say so rather than guess.
+
+### Invoking it
+
+Just ask in natural language from the project directory — Claude routes
+matching requests to it:
+
+```
+how am I doing?
+is FX conversion eating my returns?
+semis have been volatile — should I worry about my positions?
+```
+
+Or name it explicitly when you want to be sure:
+
+```
+use the trading-performance-analyst subagent to review the last 90 days
+have the trading-performance-analyst check my losing option trades
+```
+
+`/agents` lists it and lets you edit it in place.
+
+### What you get
+
+A full review follows a fixed structure: executive summary → P&L snapshot
+(realized/unrealized, shares + options, period vs all-time) → ranked cost
+drivers → behavioral pitfalls with trade-level evidence → what's working,
+quantified → market context from web search (news, upcoming earnings on open
+positions, sector trends for names you actually hold) → prioritized action
+items → data caveats. Narrow questions get a direct answer instead, still
+grounded in journal numbers.
+
+It runs on `opus` with web search, so a full review is not cheap in tokens —
+ask for a narrow scope ("just the FX costs", "just my QCOM options") when you
+don't need the whole book.
+
+### Writing back to the journal
+
+The agent's only write path is `journal_add_note`. When it finds a durable
+insight it records a dated note attributed to `author='agent'`, which shows up
+alongside your own notes in the dashboard's **Journal** tab. It has no order
+placement, no raw SQL, and no credential access — that's enforced by the MCP
+server, not just by the prompt.
+
+### Longitudinal memory
+
+The agent keeps project-scoped memory in
+`.claude/agent-memory/trading-performance-analyst/` — behavioral patterns it
+has flagged before, cost baselines to compare against, data quirks to
+re-caveat, and recommendations it already gave (so it can check whether they
+worked). This is what makes repeat reviews more useful than one-offs: run it
+on a cadence, e.g. after each ingest or weekly.
+
+That directory is **gitignored** — your trading patterns stay local while the
+agent definition itself is shared.
+
+### Fewer permission prompts
+
+A full review makes a lot of tool calls (MCP queries, web searches, shell for
+quick aggregations), each of which can prompt. Pre-approving the read-only
+ones in `.claude/settings.local.json` keeps a review from stalling halfway:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__ws-journal__journal_list_trades",
+      "mcp__ws-journal__journal_get_positions",
+      "mcp__ws-journal__journal_pnl_summary",
+      "mcp__ws-journal__journal_list_options",
+      "mcp__ws-journal__journal_symbol_history",
+      "mcp__ws-journal__journal_list_income",
+      "WebSearch"
+    ]
+  }
+}
+```
+
+`journal_add_note` is deliberately left out so journal writes still ask.
+
 ## Caveats (read these)
 
 - The API ingestion uses an **unofficial, reverse-engineered** library. It can
@@ -224,7 +323,9 @@ The `env` block is only needed if you moved the DB with `WSJ_DB_PATH`.
 - Options P&L is net premium per contract. Expiry, assignment, and exercise
   activities haven't been observed in the WS feed yet: contracts past expiry
   with open interest are assumed to expire worthless (and flagged) — verify
-  assignments manually. Dividends are not ingested at all yet.
+  assignments manually. Dividends, interest, and withholding tax are ingested
+  into `income` (queryable via `journal_list_income`) but are not yet folded
+  into the P&L totals.
 - **FX drag** is an estimate: Wealthsimple embeds its ~1.5% CAD↔USD
   conversion fee in the reported CAD amounts of every USD-listing trade, so
   realized P&L already includes the cost. The Summary metric models it at a
