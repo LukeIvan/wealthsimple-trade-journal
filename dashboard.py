@@ -3,11 +3,11 @@
     pip install streamlit plotly
     streamlit run dashboard.py
 
-Three sections, matching the project plan:
-  1. Journal     — filterable trade log + notes (yours and agent-written)
-  2. Performance — per-symbol price chart with your buys/sells overlaid,
-                   plus realized/unrealized metrics
-  3. Summary     — portfolio-level P&L, fees, FX drag
+Four sections:
+  1. Journal     — fill blotter, option trades, notes
+  2. Performance — per-symbol price chart with buys/sells overlaid
+  3. Summary     — portfolio P&L, dividends, open positions
+  4. Income      — dividends, interest, withholding
 """
 
 from __future__ import annotations
@@ -70,6 +70,17 @@ def load():
 (trades, opt_trades, notes, prices, iprices, listings,
  result, positions, opt_result, fx_result, ledger, income) = load()
 
+# Gross dividends by symbol (CAD). Withholding stays its own series so a
+# total-return figure can subtract it without changing the dividend card.
+if income.empty:
+    div_by_symbol = pd.Series(dtype=float)
+    tax_by_symbol = pd.Series(dtype=float)
+else:
+    div_by_symbol = (income.loc[income.income_type == "DIVIDEND"]
+                     .groupby("symbol")["amount_cad"].sum())
+    tax_by_symbol = (income.loc[income.income_type == "NON_RESIDENT_TAX"]
+                     .groupby("symbol")["amount_cad"].sum())
+
 
 def latest_usdcad() -> float | None:
     fx = prices[prices.symbol == "USDCAD=X"].sort_values("date")
@@ -104,7 +115,13 @@ def _warn_row_style(row):
 
 def _flat_style(v):
     # inverted: a positive flat-period move is a gain MISSED while out of
-    # the position (the exit cost you), so it reads red; negative = avoided
+    # the position (the exit cost you), so it reads red; negative = avoided.
+    # The journal ledger pre-formats this column as text so Streamlit does
+    # not render a missing value as the word "None".
+    if isinstance(v, str):
+        if not v or v in ("$0.00", "-$0.00"):
+            return ""
+        return f"color: {POS}" if v.startswith("-") else f"color: {NEG}"
     if pd.isna(v) or v == 0:
         return ""
     return f"color: {NEG}" if v > 0 else f"color: {POS}"
@@ -118,13 +135,44 @@ _MONEY_COLS = {"price", "fee", "gross_amount", "premium", "strike",
                "mtm_delta_cad", "flat_move_cad", "acb_per_share_cad",
                "acb_cad", "proceeds_cad", "gain_cad", "market_value_cad",
                "unrealized_gain_cad", "last_price", "net_premium_cad",
-               "amount_cad", "disallowed_cad"}
+               "amount_cad", "total_cad", "dividends_cad", "disallowed_cad"}
 _QTY_COLS = {"quantity", "contracts", "position_qty", "net_contracts"}
 
 
 def _money_fmt(v) -> str:
     # sign before the $ so losses read -$11.96, not $-11.96
+    if pd.isna(v):
+        return ""
     return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
+
+
+def _md_money(v) -> str:
+    """Money for captions. Streamlit treats $...$ as LaTeX."""
+    return _money_fmt(v).replace("$", "\\$")
+
+
+def _income_sum(frame: pd.DataFrame, income_type: str) -> float:
+    if frame.empty:
+        return 0.0
+    return float(frame.loc[frame.income_type == income_type, "amount_cad"].sum())
+
+
+def _naive_utc(s: pd.Series) -> pd.Series:
+    """UTC wall time as YYYY-MM-DD HH:MM. That form sorts chronologically."""
+    ts = (pd.to_datetime(s, utc=True).dt.tz_convert("UTC")
+          .dt.tz_localize(None).dt.floor("min"))
+    return ts.dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _show_options(odf: pd.DataFrame) -> None:
+    if odf.empty:
+        return
+    st.dataframe(
+        odf.style.apply(_warn_row_style, axis=1)
+        .map(_pnl_style, subset=["net_premium_cad"])
+        .map(_status_style, subset=["status"])
+        .format(_table_fmt(odf), na_rep=""),
+        use_container_width=True, hide_index=True)
 
 
 def _table_fmt(df) -> dict:
@@ -224,27 +272,46 @@ with tab_journal:
                 "realized_cad", "mtm_delta_cad",
                 "total_pnl_cad", "flat_move_cad"]],
         left_on="id", right_on="trade_id", how="left")
+    fill_cols = ["executed_at", "symbol", "action", "quantity", "price",
+                 "currency", "gross_amount", "fx_cost_cad"]
+    fill = view[fill_cols].copy()
+    fill["executed_at"] = _naive_utc(fill["executed_at"])
+    # Streamlit renders NaN as the word "None". Format the missing fee as blank
+    # here; the styler would hand the raw null through.
+    fill["fx_cost_cad"] = [
+        "" if pd.isna(v) else _money_fmt(v) for v in fill["fx_cost_cad"]]
+    fill_fmt = _table_fmt(fill)
+    fill_fmt.pop("fx_cost_cad", None)
     st.dataframe(
-        view[["executed_at", "symbol", "action", "quantity", "price",
-              "currency", "gross_amount", "fx_cost_cad", "book_cost_cad",
-              "acb_per_share_cad", "realized_cad",
-              "mtm_delta_cad", "total_pnl_cad", "flat_move_cad", "source"]]
-        .style.map(_action_style, subset=["action"])
-        .map(_pnl_style, subset=["realized_cad", "mtm_delta_cad",
-                                 "total_pnl_cad"])
-        .map(_flat_style, subset=["flat_move_cad"])
-        .format(_table_fmt(view), na_rep=""),
+        fill.style.map(_action_style, subset=["action"])
+        .format(fill_fmt, na_rep=""),
         use_container_width=True, hide_index=True)
-    st.caption("`fx_cost_cad` = Wealthsimple's ~1.5% currency-conversion fee "
-               "modeled per USD-listed trade — it's embedded in the CAD "
-               "amount and already inside your P&L (informational, not an "
-               "extra charge); blank = CAD-listed/CDR, no conversion. "
-               "Ledger columns: `realized_cad` = gain locked in "
-               "by the sell; `mtm_delta_cad` = market move on held shares "
-               "since the symbol's previous trade; `total_pnl_cad` = "
-               "cumulative realized + unrealized marked at the fill price; "
-               "`flat_move_cad` = move missed (+, red) or avoided (−, green) "
-               "between a full exit and the re-entry buy.")
+    st.caption("FX cost is Wealthsimple's ~1.5% conversion fee on CAD-settled "
+               "USD listings. It is already inside P&L. Blank means no conversion.")
+
+    with st.expander("Mark-to-market ledger"):
+        led_cols = ["executed_at", "symbol", "action", "quantity",
+                    "book_cost_cad", "acb_per_share_cad", "realized_cad",
+                    "mtm_delta_cad", "total_pnl_cad", "flat_move_cad"]
+        led = view[led_cols].copy()
+        led["executed_at"] = _naive_utc(led["executed_at"])
+        led["flat_move_cad"] = [
+            "" if pd.isna(v) else _money_fmt(v) for v in led["flat_move_cad"]]
+        led_fmt = _table_fmt(led)
+        led_fmt.pop("flat_move_cad", None)
+        st.dataframe(
+            led.style.map(_action_style, subset=["action"])
+            .map(_pnl_style, subset=["realized_cad", "mtm_delta_cad",
+                                     "total_pnl_cad"])
+            .map(_flat_style, subset=["flat_move_cad"])
+            .format(led_fmt, na_rep=""),
+            use_container_width=True, hide_index=True)
+        st.caption("`realized_cad` is the gain locked in by the sell. "
+                   "`mtm_delta_cad` is the market move on held shares since "
+                   "the symbol's previous trade. `total_pnl_cad` is cumulative "
+                   "realized plus unrealized, marked at the fill price. "
+                   "`flat_move_cad` is the move missed (+, red) or avoided "
+                   "(−, green) between a full exit and the re-entry buy.")
 
     if not opt_trades.empty:
         st.subheader("Option trades")
@@ -253,6 +320,7 @@ with tab_journal:
             oview = oview[oview.underlying == sym]
         if act != "All":
             oview = oview[oview.action == act]
+        oview["occurred_at"] = _naive_utc(oview["occurred_at"])
         st.dataframe(
             oview[["occurred_at", "underlying", "contract_type", "strike",
                    "expiry", "action", "contracts", "premium", "currency"]]
@@ -287,24 +355,49 @@ with tab_perf:
     # option-only underlyings (no share trades) must show up too
     perf_syms = sorted(set(trades.symbol.unique())
                        | set(opt_trades.underlying.unique()))
-    psym = st.selectbox("Pick a symbol", perf_syms, key="perf_sym")
+    held = [p for p in positions if p.get("market_value_cad")]
+    default_sym = (max(held, key=lambda p: p["market_value_cad"])["symbol"]
+                   if held else perf_syms[0])
+    default_idx = perf_syms.index(default_sym) if default_sym in perf_syms else 0
+    psym = st.selectbox("Pick a symbol", perf_syms, index=default_idx,
+                        key="perf_sym")
     t = trades[trades.symbol == psym].sort_values("executed_at")
     px = prices[prices.symbol == psym].sort_values("date")
     osel = opt_trades[opt_trades.underlying == psym].sort_values("occurred_at")
     ocontracts = [c for c in opt_result["contracts"]
                   if c["underlying"] == psym]
 
-    m1, m2, m3, m4, m5 = st.columns(5)
     lots = pd.DataFrame(result["realized"])
     sym_lots = lots[lots.symbol == psym] if not lots.empty else pd.DataFrame()
     pos = next((p for p in positions if p["symbol"] == psym), None)
-    _signed_metric(m1, "Realized P&L (CAD)",
-                   sym_lots.gain_cad.sum() if not sym_lots.empty else 0.0)
+    realized = float(sym_lots.gain_cad.sum()) if not sym_lots.empty else 0.0
+    # No open position means nothing left to mark. A position with no cached
+    # price has an unknown mark, so the total stays blank rather than treating
+    # the unrealized leg as zero.
+    if pos is None:
+        unreal = 0.0
+    else:
+        unreal = pos.get("unrealized_gain_cad")
+        unreal = None if unreal is None else float(unreal)
+    divs = float(div_by_symbol.get(psym, 0.0))
+    withholding = float(tax_by_symbol.get(psym, 0.0))
+    opt_realized = sum(c["net_premium_cad"] for c in ocontracts
+                       if c["status"] in ("closed", "expired"))
+    total_return = (None if unreal is None else
+                    realized + unreal + divs + withholding + opt_realized)
+
+    tr, _ = st.columns([1, 3])
+    _signed_metric(tr, "Total return (CAD)", total_return)
+    st.caption("Realized share P&L + unrealized + dividends − withholding "
+               "+ realized option premium. Open option premium is not included.")
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    _signed_metric(m1, "Realized P&L (CAD)", realized)
     m2.metric("Open quantity", f"{pos['quantity']:g}" if pos else "0")
     m3.metric("ACB / share (CAD)",
               f"{pos['acb_per_share_cad']:,.4f}" if pos else "—")
-    _signed_metric(m4, "Unrealized (CAD)",
-                   pos.get("unrealized_gain_cad") if pos else None)
+    _signed_metric(m4, "Unrealized (CAD)", unreal if pos else None)
+    _signed_metric(m6, "Dividends received (CAD)", divs)
     if len(px) >= 2:
         last, prev = float(px.close.iloc[-1]), float(px.close.iloc[-2])
         m5.metric(f"Last close ({px.currency.iloc[-1]})", f"{last:,.2f}",
@@ -315,9 +408,7 @@ with tab_perf:
     if ocontracts:
         o_open = [c for c in ocontracts if c["status"] == "open"]
         o1, o2, o3 = st.columns(3)
-        _signed_metric(o1, "Options premium realized (CAD)",
-                       sum(c["net_premium_cad"] for c in ocontracts
-                           if c["status"] in ("closed", "expired")))
+        _signed_metric(o1, "Options premium realized (CAD)", opt_realized)
         o2.metric("Open option contracts",
                   f"{sum(abs(c['net_contracts']) for c in o_open):g}")
         _signed_metric(o3, "Open net premium (CAD)",
@@ -461,8 +552,10 @@ with tab_perf:
                               annotation_font_size=10,
                               annotation_font_color="#9ca3af")
 
-        fig.update_layout(height=450, margin=dict(t=20, b=20),
-                          yaxis_title=f"Price ({quote_ccy})")
+        fig.update_layout(
+            height=450, margin=dict(t=40, b=20),
+            yaxis_title=f"Price ({quote_ccy})",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
         st.plotly_chart(fig, use_container_width=True)
         if converted:
             st.caption(f"Buy/sell markers converted to {quote_ccy} at "
@@ -553,43 +646,78 @@ with tab_summary:
     s = result["summary"]
     os_ = opt_result["summary"]
     total_unrealized = sum(p.get("unrealized_gain_cad") or 0 for p in positions)
-    net_income_cad = income.amount_cad.sum() if not income.empty else 0.0
-    c1, c2, c3, c4, c5 = st.columns(5, gap="medium")
-    _signed_metric(c1, "Total realized gain (CAD)", s["realized_gain_cad"])
-    _signed_metric(c2, "Total unrealized gain (CAD)",
+    divs_cad = _income_sum(income, "DIVIDEND")
+    int_cad = _income_sum(income, "INTEREST")
+    tax_cad = _income_sum(income, "NON_RESIDENT_TAX")
+    fee_cad = _income_sum(income, "FEE")
+    promo_cad = _income_sum(income, "PROMOTION")
+
+    pos_df = pd.DataFrame(positions)
+    total_mv = None
+    if not pos_df.empty and "market_value_cad" in pos_df.columns:
+        mv = pos_df.market_value_cad.fillna(0)
+        if float(mv.sum()):
+            total_mv = float(mv.sum())
+            pos_df["weight"] = mv / total_mv
+            pos_df = pos_df.sort_values(
+                "market_value_cad", ascending=False, na_position="last")
+    if not pos_df.empty:
+        pos_df["dividends_cad"] = pos_df.symbol.map(div_by_symbol).fillna(0.0)
+
+    st.markdown("**Trading**")
+    c1, c2, c3, c4 = st.columns(4, gap="medium")
+    _signed_metric(c1, "Realized (shares)", s["realized_gain_cad"])
+    _signed_metric(c2, "Unrealized",
                    total_unrealized if positions else None)
-    _signed_metric(c3, "FX conversion drag (CAD)", -fx_result['modeled_drag_cad'])
-    _signed_metric(c4, "Options premium realized (CAD)",
-                   os_["realized_premium_cad"])
-    _signed_metric(c5, "Net income (CAD)", net_income_cad)
+    _signed_metric(c3, "Options premium", os_["realized_premium_cad"])
+    if total_mv is None:
+        c4.metric("Market value", "—")
+    else:
+        c4.metric("Market value", f"${total_mv:,.2f}")
+
+    st.markdown("**Income and costs**")
+    d1, d2, d3, d4 = st.columns(4, gap="medium")
+    _signed_metric(d1, "Dividends received", divs_cad)
+    _signed_metric(d2, "Interest", int_cad)
+    _signed_metric(d3, "Withholding tax", tax_cad)
+    _signed_metric(d4, "FX conversion drag", -fx_result["modeled_drag_cad"])
     emp = fx_result["empirical"]
-    fx_note = (f"FX drag modeled at {fx_result['fee_rate']:.2%} on "
-               f"{fx_result['usd_volume_cad']:,.0f} CAD of USD-listing volume "
-               f"({fx_result['n_usd_trades']} trades, "
-               f"{fx_result['n_usd_option_fills']} option fills). "
-               "Already embedded in realized gains — shown for awareness, "
-               "not subtracted again.")
+    note = (
+        "Dividends are gross (cash, DIY, and manufactured / securities-lending) "
+        "and are not reduced by withholding. "
+        f"Fees ({_md_money(fee_cad)}) and promotions ({_md_money(promo_cad)}) "
+        "are excluded — see the Income tab. "
+        f"FX drag is modeled at {fx_result['fee_rate']:.2%} on "
+        f"{fx_result['usd_volume_cad']:,.0f} CAD of USD-listing volume "
+        f"({fx_result['n_usd_trades']} trades, "
+        f"{fx_result['n_usd_option_fills']} option fills) and is already "
+        "embedded in realized gains — shown for awareness, not subtracted."
+    )
     if emp["hourly_median_premium"] is not None:
-        fx_note += (f" Observed premium on {emp['n_hourly']} hourly-matched "
-                    f"trades: {emp['hourly_median_premium']:.2%}.")
-    st.caption(fx_note)
+        note += (f" Observed premium on {emp['n_hourly']} hourly-matched "
+                 f"trades: {emp['hourly_median_premium']:.2%}.")
+    st.caption(note)
 
     st.subheader("Open positions")
-    pos_df = pd.DataFrame(positions)
     if pos_df.empty:
         st.caption("No open positions.")
     else:
-        col_cfg = {}
-        if "market_value_cad" in pos_df.columns:
-            total_mv = pos_df.market_value_cad.fillna(0).sum()
-            if total_mv:
-                pos_df["weight"] = pos_df.market_value_cad.fillna(0) / total_mv
-                col_cfg["weight"] = st.column_config.ProgressColumn(
-                    "weight", min_value=0.0, max_value=1.0, format="percent")
-        sty = pos_df.style.apply(_warn_row_style, axis=1)
-        if "unrealized_gain_cad" in pos_df.columns:
+        lead = ["symbol", "quantity", "market_value_cad", "unrealized_gain_cad",
+                "weight", "dividends_cad", "acb_per_share_cad", "last_price"]
+        show_cols = [c for c in lead if c in pos_df.columns]
+        style_cols = show_cols + (["warnings"] if "warnings" in pos_df.columns
+                                   else [])
+        shown = pos_df[style_cols]
+        sty = shown.style.apply(_warn_row_style, axis=1)
+        if "unrealized_gain_cad" in shown.columns:
             sty = sty.map(_pnl_style, subset=["unrealized_gain_cad"])
-        sty = sty.format(_table_fmt(pos_df), na_rep="")
+        sty = sty.format(_table_fmt(shown), na_rep="")
+        col_cfg = {}
+        if "weight" in shown.columns:
+            col_cfg["weight"] = st.column_config.ProgressColumn(
+                "weight", min_value=0.0, max_value=1.0, format="percent")
+        if "warnings" in shown.columns:
+            col_cfg["warnings"] = None
         st.dataframe(sty, use_container_width=True, hide_index=True,
                      column_config=col_cfg)
 
@@ -597,61 +725,78 @@ with tab_summary:
         st.subheader("Option contracts")
         odf = pd.DataFrame(opt_result["contracts"])
         odf["warnings"] = odf.warnings.map("; ".join)
-        st.dataframe(
-            odf.style.apply(_warn_row_style, axis=1)
-            .map(_pnl_style, subset=["net_premium_cad"])
-            .map(_status_style, subset=["status"])
-            .format(_table_fmt(odf), na_rep=""),
-            use_container_width=True, hide_index=True)
+        open_odf = odf[odf.status == "open"]
+        closed_odf = odf[odf.status != "open"]
+        if open_odf.empty:
+            st.caption("No open option contracts.")
+        else:
+            _show_options(open_odf)
         if (odf.status == "expired").any():
             st.warning("Expired contracts assume worthless expiry — "
                        "assignment/exercise isn't tracked yet; verify manually.")
+        if not closed_odf.empty:
+            with st.expander(
+                    f"Closed and expired contracts ({len(closed_odf)})"):
+                _show_options(closed_odf)
 
     st.subheader("Realized P&L by symbol")
     if not lots.empty:
         by_sym = lots.groupby("symbol").gain_cad.sum().sort_values()
-        figb = go.Figure(go.Bar(
-            x=by_sym.values, y=by_sym.index, orientation="h",
-            marker_color=[POS if v >= 0 else NEG for v in by_sym.values]))
-        figb.update_layout(height=max(240, 28 * len(by_sym)),
-                           margin=dict(t=10, b=10),
-                           xaxis_title="Realized gain (CAD)")
-        st.plotly_chart(figb, use_container_width=True)
+        winners = by_sym[by_sym > 0].nlargest(10)
+        losers = by_sym[by_sym < 0].nsmallest(10)
+        show = pd.concat([losers, winners]).sort_values()
+        if not show.empty:
+            figb = go.Figure(go.Bar(
+                x=show.values, y=show.index, orientation="h",
+                marker_color=[POS if v >= 0 else NEG for v in show.values]))
+            figb.update_layout(height=max(240, 28 * len(show)),
+                               margin=dict(t=10, b=10),
+                               xaxis_title="Realized gain (CAD)")
+            st.plotly_chart(figb, use_container_width=True)
+            st.caption("Largest winners and losers, up to ten of each.")
+        full = (by_sym.sort_values(ascending=False)
+                .rename("gain_cad").reset_index())
+        with st.expander(f"All symbols ({len(full)})"):
+            st.dataframe(
+                full.style.map(_pnl_style, subset=["gain_cad"])
+                .format(_table_fmt(full), na_rep=""),
+                use_container_width=True, hide_index=True)
 
-    st.subheader("Realized lots (ACB method)")
-    if not lots.empty:
-        sty = lots.style.map(_pnl_style, subset=["gain_cad"])
-        if "is_superficial" in lots.columns:
-            sty = sty.apply(
-                lambda row: [WARN_BG if row.get("is_superficial") else ""
-                             for _ in row],
-                axis=1)
-            if "disallowed_cad" in lots.columns:
-                sty = sty.map(_pnl_style, subset=["disallowed_cad"])
-        st.dataframe(sty.format(_table_fmt(lots), na_rep=""),
-                     use_container_width=True, hide_index=True)
         losses = lots[lots.gain_cad < 0]
-        if not losses.empty:
-            if "is_superficial" in losses.columns:
-                n_sfl = int(losses.is_superficial.sum())
-                if n_sfl:
+        if (not losses.empty and "is_superficial" in losses.columns
+                and int(losses.is_superficial.sum())):
+            n_sfl = int(losses.is_superficial.sum())
+            st.warning(
+                f"{n_sfl} loss lot(s) flagged as superficial — a "
+                f"repurchase of the same symbol was found within ±30 "
+                f"days and the position was still held at the 30-day "
+                f"cutoff. The disallowed loss is NOT yet added back to "
+                f"ACB — reconcile `disallowed_cad` manually on your T1.")
+        with st.expander("Tax lots (ACB)"):
+            sty = lots.style.map(_pnl_style, subset=["gain_cad"])
+            if "is_superficial" in lots.columns:
+                sty = sty.apply(
+                    lambda row: [WARN_BG if row.get("is_superficial") else ""
+                                 for _ in row],
+                    axis=1)
+                if "disallowed_cad" in lots.columns:
+                    sty = sty.map(_pnl_style, subset=["disallowed_cad"])
+            st.dataframe(sty.format(_table_fmt(lots), na_rep=""),
+                         use_container_width=True, hide_index=True)
+            if not losses.empty:
+                if "is_superficial" in losses.columns:
+                    unconfirmed = losses[~losses.is_superficial]
+                    if not unconfirmed.empty:
+                        st.warning(
+                            f"{len(unconfirmed)} loss lot(s) had no detected "
+                            f"repurchase in this account within ±30 days. "
+                            f"Affiliated persons' accounts are not checked — "
+                            f"verify manually before claiming on your T1.")
+                else:
                     st.warning(
-                        f"{n_sfl} loss lot(s) flagged as superficial — a "
-                        f"repurchase of the same symbol was found within ±30 "
-                        f"days and the position was still held at the 30-day "
-                        f"cutoff. The disallowed loss is NOT yet added back to "
-                        f"ACB — reconcile `disallowed_cad` manually on your T1.")
-                unconfirmed = losses[~losses.is_superficial]
-                if not unconfirmed.empty:
-                    st.warning(
-                        f"{len(unconfirmed)} loss lot(s) had no detected "
-                        f"repurchase in this account within ±30 days. Affiliated "
-                        f"persons' accounts are not checked — verify manually "
-                        f"before claiming on your T1.")
-            else:
-                st.warning("Loss lots above should be checked against the "
-                           "superficial-loss rule (repurchase within ±30 days) "
-                           "before claiming on taxes.")
+                        "Loss lots in this table should be checked against "
+                        "the superficial-loss rule (repurchase within ±30 "
+                        "days) before claiming on taxes.")
     else:
         st.caption("No closed lots yet.")
 
@@ -666,15 +811,20 @@ with tab_income:
         inc_f = (income if year_sel == "All"
                  else income[income.occurred_at.dt.year == int(year_sel)])
 
-        divs_cad = inc_f.loc[inc_f.income_type == "DIVIDEND", "amount_cad"].sum()
-        int_cad = inc_f.loc[inc_f.income_type == "INTEREST", "amount_cad"].sum()
-        tax_cad = inc_f.loc[inc_f.income_type == "NON_RESIDENT_TAX", "amount_cad"].sum()
+        divs_cad = _income_sum(inc_f, "DIVIDEND")
+        int_cad = _income_sum(inc_f, "INTEREST")
+        tax_cad = _income_sum(inc_f, "NON_RESIDENT_TAX")
         net_cad = divs_cad + int_cad + tax_cad
         ic1, ic2, ic3, ic4 = st.columns(4)
         _signed_metric(ic1, "Dividends received (CAD)", divs_cad)
         _signed_metric(ic2, "Interest received (CAD)", int_cad)
         _signed_metric(ic3, "Withholding tax (CAD)", tax_cad)
         _signed_metric(ic4, "Net income (CAD)", net_cad)
+        st.caption(
+            "Net income is dividends + interest + withholding. "
+            f"Fees ({_md_money(_income_sum(inc_f, 'FEE'))}) and promotions "
+            f"({_md_money(_income_sum(inc_f, 'PROMOTION'))}) are under "
+            "All income events and are not included.")
 
         inc_sorted = inc_f.sort_values("occurred_at")
         if not inc_sorted.empty:
