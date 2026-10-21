@@ -25,6 +25,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+from .prices import daily_fx_map
+
 
 @dataclass
 class Position:
@@ -40,12 +42,21 @@ class Position:
 
 
 def _to_cad(amount: float, currency: str, fx_rate: float | None,
-            pos: Position) -> float:
+            pos: Position, trade_date: str | None = None,
+            daily_fx: dict[str, float] | None = None) -> float:
     if currency == "CAD":
         return amount
     if fx_rate:
         pos.last_fx_rate = fx_rate
         return amount * fx_rate
+    if daily_fx and trade_date:
+        hist = daily_fx.get(trade_date[:10])
+        if hist:
+            pos.last_fx_rate = hist
+            return amount * hist
+        # Date missing from cache (weekend / holiday gap) — use nearest prior.
+        # No warning: the cache is populated; the gap is expected.
+        return amount * pos.last_fx_rate
     pos.warnings.append(
         f"missing fx_rate; used last known {pos.last_fx_rate:.4f}"
     )
@@ -61,8 +72,12 @@ def compute(conn: sqlite3.Connection) -> dict:
     # Seed the FX fallback from the cached USDCAD=X rate so that USD trades
     # with null fx_rate convert at a real rate rather than the 1.0 default.
     # This handles payloads where WS reports amount in USD (not CAD) and
-    # omits fxRate — seen in DIY_BUY/SELL activities from ~2026-07.
+    # omits fxRate — seen in DIY_BUY/SELL activities from ~2026-07 (hybrid account).
     _seed_fx = _usdcad(conn) or 1.0
+    # Date-keyed map of daily USDCAD=X closes for historical ACB accuracy.
+    # Each USD trade uses the rate for its own execution date; weekend/holiday
+    # gaps fall back to pos.last_fx_rate (the preceding trade's rate).
+    _dfx = daily_fx_map(conn)
 
     positions: dict[str, Position] = {}
     realized: list[dict] = []
@@ -71,8 +86,9 @@ def compute(conn: sqlite3.Connection) -> dict:
     for r in rows:
         pos = positions.setdefault(
             r["symbol"], Position(r["symbol"], last_fx_rate=_seed_fx))
-        fee_cad = _to_cad(r["fee"], r["currency"], r["fx_rate"], pos)
-        gross_cad = _to_cad(r["gross_amount"], r["currency"], r["fx_rate"], pos)
+        td = str(r["executed_at"])[:10]
+        fee_cad = _to_cad(r["fee"], r["currency"], r["fx_rate"], pos, td, _dfx)
+        gross_cad = _to_cad(r["gross_amount"], r["currency"], r["fx_rate"], pos, td, _dfx)
         total_fees_cad += fee_cad
 
         if r["action"] == "BUY":
@@ -243,6 +259,7 @@ def trade_ledger(conn: sqlite3.Connection) -> list[dict]:
     ).fetchall()
 
     _seed_fx = _usdcad(conn) or 1.0
+    _dfx = daily_fx_map(conn)
     out: list[dict] = []
     positions: dict[str, Position] = {}
     sym_state: dict[str, dict] = {}
@@ -254,8 +271,9 @@ def trade_ledger(conn: sqlite3.Connection) -> list[dict]:
             "realized_cum": 0.0, "prev_total": None,
             "exit_price": None, "exit_qty": 0.0,
         })
-        fee_cad = _to_cad(r["fee"], r["currency"], r["fx_rate"], pos)
-        gross_cad = _to_cad(r["gross_amount"], r["currency"], r["fx_rate"], pos)
+        td = str(r["executed_at"])[:10]
+        fee_cad = _to_cad(r["fee"], r["currency"], r["fx_rate"], pos, td, _dfx)
+        gross_cad = _to_cad(r["gross_amount"], r["currency"], r["fx_rate"], pos, td, _dfx)
         fill_ps = gross_cad / r["quantity"] if r["quantity"] else 0.0
 
         realized, flat_move = 0.0, None

@@ -23,13 +23,17 @@ overridable via `WSJ_DB_PATH`):
   to the MCP layer.
 - Tax convention: ACB (not FIFO), computed in CAD; USD trades convert at
   per-trade `fx_rate` (CAD per USD).
-- **Currency convention (verified against real payloads 2026-06-10):**
-  the WS activity feed reports `amount` and `currency` in the ACCOUNT
-  currency (always CAD), with the FX conversion (~1.42 effective, i.e. mid
-  rate + WS's ~1.5% fee) already baked in. So `trades.currency` ==
-  settlement currency and `trades.price` is a CAD-equivalent. By contrast
-  `prices.currency` is the LISTING's quote currency from Yahoo. Never use
-  one to infer the other — that conflation caused the `.TO`-suffix bug.
+- **Currency convention:** For a CAD-only account (pre-2026-07), WS reported
+  `amount` in CAD with FX already baked in (`currency='CAD'`, `fx_rate`
+  informational). For a **CAD/USD hybrid account** (switched 2026-07), USD
+  trades settle in USD with no WS conversion: `currency='USD'`, `fx_rate=NULL`.
+  The ACB engine resolves these using the daily `USDCAD=X` close from the
+  `prices` table for the trade date (`acb._daily_fx_map`); `pos.last_fx_rate`
+  is the fallback for weekend/holiday gaps or a cold cache. `acb.unrealized()`
+  correctly uses the latest cached rate for mark-to-market (no change needed
+  there). `prices.currency` is the LISTING's quote currency from Yahoo —
+  never use it to infer trade settlement currency or vice versa (that
+  conflation caused the `.TO`-suffix bug).
 - Options activities (`OPTIONS_BUY`/`OPTIONS_SELL`) go to `option_trades`,
   never to `trades`; `premium` is the total cash amount (×100 multiplier
   already included). `python -m wsjournal.ingest_api --renormalize` replays

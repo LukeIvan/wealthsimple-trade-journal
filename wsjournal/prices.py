@@ -133,10 +133,22 @@ def _resolve_symbol(conn, symbol: str, start: date):
         return ysym, ccy, "only_candidate", None, pairs
 
     trades = conn.execute(
-        "SELECT substr(executed_at,1,10) AS day, price FROM trades "
-        "WHERE symbol=?", (symbol,)).fetchall()
-    fx = {r["date"]: r["close"] for r in conn.execute(
-        "SELECT date, close FROM prices WHERE symbol=?", (FX_SYMBOL,))}
+        "SELECT substr(executed_at,1,10) AS day, price, currency, fx_rate "
+        "FROM trades WHERE symbol=?", (symbol,)).fetchall()
+    fx = daily_fx_map(conn)
+
+    def _cad_price(t) -> float | None:
+        """Trade price in CAD. Pre-hybrid (or fx_rate'd) trades already
+        carry a CAD-equivalent price/rate; native-USD hybrid trades
+        (currency='USD', fx_rate NULL) need that day's cached USDCAD=X
+        close — otherwise comparing a raw USD price straight to a CAD
+        candidate close (or vice versa) silently corrupts the fit score."""
+        if t["currency"] == "CAD":
+            return t["price"]
+        if t["fx_rate"]:
+            return t["price"] * t["fx_rate"]
+        rate = fx.get(t["day"])
+        return t["price"] * rate if rate else None
 
     best = None
     for ysym, ccy, pairs in with_data:
@@ -145,9 +157,10 @@ def _resolve_symbol(conn, symbol: str, start: date):
         for t in trades:
             close = closes.get(t["day"])
             conv = fx.get(t["day"]) if ccy == "USD" else 1.0
-            if not close or not conv or t["price"] <= 0:
+            cad_price = _cad_price(t)
+            if not close or not conv or cad_price is None or cad_price <= 0:
                 continue
-            errs.append(abs(math.log(t["price"] / (close * conv))))
+            errs.append(abs(math.log(cad_price / (close * conv))))
         if not errs:
             continue
         errs.sort()
@@ -166,6 +179,19 @@ def _resolve_symbol(conn, symbol: str, start: date):
         print(f"  ! {symbol}: best listing {ysym} fits trades poorly "
               f"(score {score:.2f}) — splits? Pin in SYMBOL_OVERRIDES if wrong")
     return ysym, ccy, "price_fit", round(score, 4), pairs
+
+
+def daily_fx_map(conn) -> dict[str, float]:
+    """Daily USDCAD=X closes keyed by ISO date.
+
+    Used to convert a USD amount to CAD at the rate that applied on a given
+    date (CRA requirement for ACB; also needed for price-fit scoring and
+    income normalization once a trade/income row carries no CAD amount and
+    no fx_rate — the hybrid-account case) rather than today's rate.
+    """
+    return {r["date"]: r["close"] for r in conn.execute(
+        "SELECT date, close FROM prices WHERE symbol=?", (FX_SYMBOL,)
+    ).fetchall()}
 
 
 def _store_listing(conn, symbol: str, ysym: str, ccy: str,

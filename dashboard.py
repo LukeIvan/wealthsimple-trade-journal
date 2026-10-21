@@ -196,44 +196,6 @@ st.html(
     " font-size:clamp(3.5px, 0.55vw, 8px);'>"
     + BANNER + "</pre></div>")
 
-_, _ctrl_col = st.columns([10, 1])
-with _ctrl_col.popover("⚙", use_container_width=True):
-    st.markdown("**Data controls**")
-    if st.button("⬇ Run API ingest",
-                 help="Pull new activities from Wealthsimple "
-                      "(requires cached auth tokens — see terminal on first run)",
-                 use_container_width=True):
-        with st.spinner("Fetching activities — this may take 1-2 minutes…"):
-            _r = subprocess.run(
-                [sys.executable, "-m", "wsjournal.ingest_api"],
-                capture_output=True, text=True,
-            )
-        if _r.returncode == 0:
-            st.success(_r.stdout or "Ingest complete.")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            _out = (_r.stdout + _r.stderr).strip()
-            st.error(f"Ingest failed.\n\n```\n{_out}\n```")
-            if "authenticat" in _out.lower() or "eoferror" in _out.lower():
-                st.info("Token cache missing or expired — run "
-                        "`python -m wsjournal.ingest_api` in a terminal "
-                        "to re-authenticate, then retry here.")
-    if st.button("↻ Refresh price cache",
-                 help="Update daily and hourly closes from Yahoo Finance (~2-5 min)",
-                 use_container_width=True):
-        with st.spinner("Fetching prices from Yahoo Finance…"):
-            _r = subprocess.run(
-                [sys.executable, "-m", "wsjournal.prices"],
-                capture_output=True, text=True,
-            )
-        if _r.returncode == 0:
-            st.success(_r.stdout or "Price cache updated.")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error(f"Price refresh failed.\n\n```\n{_r.stderr or _r.stdout}\n```")
-
 if trades.empty:
     st.info("No trades yet. Run `python -m wsjournal.ingest_api` or "
             "`python -m wsjournal.ingest_csv <file.csv>` first.")
@@ -407,16 +369,23 @@ with tab_perf:
             def event_x(s): return s.dt.strftime("%Y-%m-%d") if hasattr(s, "dt") \
                 else s.strftime("%Y-%m-%d")
 
-        # Trade prices are in the account currency (CAD); quotes are in the
-        # listing's currency. Convert markers so they sit on the price line.
-        trade_ccy = tm.currency.iloc[0] if not tm.empty else quote_ccy
-        marker_scale, converted = 1.0, False
-        if not tm.empty and trade_ccy != quote_ccy:
-            usdcad = latest_usdcad()
-            if usdcad and trade_ccy == "CAD" and quote_ccy == "USD":
-                marker_scale, converted = 1.0 / usdcad, True
-            elif usdcad and trade_ccy == "USD" and quote_ccy == "CAD":
-                marker_scale, converted = usdcad, True
+        # Each trade's price is in ITS OWN settlement currency — CAD
+        # pre-hybrid, natively USD post-2026-07-01 for some symbols — while
+        # quotes are in the listing's currency. A symbol's trade history can
+        # span the switch, so scale per row, not once for the whole window.
+        usdcad = latest_usdcad()
+        converted = False
+        if tm.empty:
+            marker_scale = pd.Series(dtype=float)
+        else:
+            marker_scale = pd.Series(1.0, index=tm.index)
+            if usdcad:
+                to_usd = (tm.currency == "CAD") & (quote_ccy == "USD")
+                to_cad = (tm.currency == "USD") & (quote_ccy == "CAD")
+                marker_scale[to_usd] = 1.0 / usdcad
+                marker_scale[to_cad] = usdcad
+                converted = bool((to_usd | to_cad).any())
+        tm = tm.assign(_marker_scale=marker_scale)
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=x_close, y=y_close, name="Close",
@@ -424,11 +393,11 @@ with tab_perf:
         buys = tm[tm.action == "BUY"]
         sells = tm[tm.action == "SELL"]
         fig.add_trace(go.Scatter(
-            x=marker_x(buys), y=buys.price * marker_scale, mode="markers",
+            x=marker_x(buys), y=buys.price * buys._marker_scale, mode="markers",
             name="Buys",
             marker=dict(symbol="triangle-up", size=11, color=POS)))
         fig.add_trace(go.Scatter(
-            x=marker_x(sells), y=sells.price * marker_scale, mode="markers",
+            x=marker_x(sells), y=sells.price * sells._marker_scale, mode="markers",
             name="Sells",
             marker=dict(symbol="triangle-down", size=11, color=NEG)))
 
@@ -496,9 +465,10 @@ with tab_perf:
                           yaxis_title=f"Price ({quote_ccy})")
         st.plotly_chart(fig, use_container_width=True)
         if converted:
-            st.caption(f"Buy/sell markers converted {trade_ccy} → {quote_ccy} "
-                       "at today's USD/CAD rate (per-trade rates unavailable); "
-                       "marker placement is approximate.")
+            st.caption(f"Buy/sell markers converted to {quote_ccy} at "
+                       "today's USD/CAD rate where a trade's own currency "
+                       "differs from the quote (per-trade historical rates "
+                       "unavailable); marker placement is approximate.")
         if strikes_skipped:
             st.caption(f"⚠️ {strikes_skipped} option strike line(s) not drawn — "
                        "far outside the plotted price range, so the option "
@@ -756,3 +726,42 @@ with tab_income:
                 all_inc.style.map(_pnl_style, subset=["amount_cad"])
                 .format(_table_fmt(all_inc), na_rep=""),
                 use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------- Data controls
+st.divider()
+with st.expander("Data controls"):
+    _dc1, _dc2 = st.columns(2)
+    if _dc1.button("⬇ Run API ingest",
+                   help="Pull new activities from Wealthsimple "
+                        "(requires cached auth tokens — see terminal on first run)",
+                   use_container_width=True):
+        with st.spinner("Fetching activities — this may take 1-2 minutes…"):
+            _r = subprocess.run(
+                [sys.executable, "-m", "wsjournal.ingest_api"],
+                capture_output=True, text=True,
+            )
+        if _r.returncode == 0:
+            st.success(_r.stdout or "Ingest complete.")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            _out = (_r.stdout + _r.stderr).strip()
+            st.error(f"Ingest failed.\n\n```\n{_out}\n```")
+            if "authenticat" in _out.lower() or "eoferror" in _out.lower():
+                st.info("Token cache missing or expired — run "
+                        "`python -m wsjournal.ingest_api` in a terminal "
+                        "to re-authenticate, then retry here.")
+    if _dc2.button("↻ Refresh price cache",
+                   help="Update daily and hourly closes from Yahoo Finance (~2-5 min)",
+                   use_container_width=True):
+        with st.spinner("Fetching prices from Yahoo Finance…"):
+            _r = subprocess.run(
+                [sys.executable, "-m", "wsjournal.prices"],
+                capture_output=True, text=True,
+            )
+        if _r.returncode == 0:
+            st.success(_r.stdout or "Price cache updated.")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error(f"Price refresh failed.\n\n```\n{_r.stderr or _r.stdout}\n```")

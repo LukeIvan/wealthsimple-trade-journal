@@ -31,6 +31,7 @@ import sys
 from datetime import datetime, timezone
 
 from . import db
+from .prices import daily_fx_map
 
 # Map raw activity -> normalized trade. Single place to fix if WS renames fields.
 # Key names verified against the FetchActivityFeedItems fragment in
@@ -122,10 +123,20 @@ def normalize_option(payload: dict) -> dict | None:
     }
 
 
-def normalize_income(payload: dict) -> dict | None:
+def normalize_income(payload: dict, daily_fx: dict[str, float] | None = None,
+                     fallback_rate: float | None = None) -> dict | None:
     """Normalize DIVIDEND / INTEREST / NON_RESIDENT_TAX / FEE / PROMOTION
-    into an income row.  All WS amounts arrive in CAD already; amountSign
-    tells us the cash direction (negative for tax and fees)."""
+    into an income row, always in CAD. amountSign tells us the cash
+    direction (negative for tax and fees).
+
+    Most WS income arrives in CAD already, but some — e.g. fully-paid
+    securities-lending interest (subType FPL_INTEREST) — is paid in the
+    security's native currency regardless of account type, and hybrid-
+    account (post-2026-07-01) dividends could be too. Non-CAD amounts are
+    converted via that day's cached USDCAD=X close (daily_fx), falling back
+    to fallback_rate (e.g. the latest cached rate) if the exact date isn't
+    cached.
+    """
     raw_type = str(payload.get("type") or "").upper()
     if raw_type not in INCOME_TYPES:
         return None
@@ -136,6 +147,15 @@ def normalize_income(payload: dict) -> dict | None:
     if not amount:
         return None
     sign = -1 if str(payload.get("amountSign") or "positive").lower() == "negative" else 1
+    occurred_at = str(payload.get("occurredAt") or "")
+    ccy = str(payload.get("currency") or "CAD").upper()
+    if ccy != "CAD":
+        rate = (daily_fx or {}).get(occurred_at[:10]) or fallback_rate
+        if rate:
+            amount *= rate
+        else:
+            print(f"  ! income {raw_type} on {occurred_at[:10] or '?'} is "
+                  f"{ccy} with no cached USD/CAD rate — stored unconverted")
     # assetSymbol is a real ticker only for DIVIDEND and NON_RESIDENT_TAX;
     # for INTEREST and FEE it's null or the literal string "CAD".
     raw_sym = payload.get("assetSymbol")
@@ -143,7 +163,7 @@ def normalize_income(payload: dict) -> dict | None:
     return {
         "id": str(payload.get("canonicalId") or _synthetic_id(payload)),
         "account_id": str(payload.get("accountId") or "unknown"),
-        "occurred_at": str(payload.get("occurredAt") or ""),
+        "occurred_at": occurred_at,
         "income_type": raw_type,
         "sub_type": payload.get("subType"),
         "symbol": symbol,
@@ -321,6 +341,8 @@ def pull(inspect: bool = False) -> None:
     db.init_db()
     n_trades = n_options = n_fx = n_income = 0
     with db.connect() as conn:
+        dfx = daily_fx_map(conn)
+        fallback_rate = dfx.get(max(dfx)) if dfx else None
         for a in activities:
             payload = a if isinstance(a, dict) else a.__dict__
             rid = str(payload.get("id") or _synthetic_id(payload))
@@ -349,7 +371,7 @@ def pull(inspect: bool = False) -> None:
                 )
                 n_fx += 1
                 continue
-            inc = normalize_income(payload)
+            inc = normalize_income(payload, daily_fx=dfx, fallback_rate=fallback_rate)
             if inc:
                 inc["raw_id"] = rid
                 db.upsert_income(conn, inc)
@@ -374,6 +396,8 @@ def renormalize() -> None:
         conn.execute("DELETE FROM trades WHERE source='ws_api'")
         conn.execute("DELETE FROM option_trades WHERE source='ws_api'")
         conn.execute("DELETE FROM income WHERE source='ws_api'")
+        dfx = daily_fx_map(conn)
+        fallback_rate = dfx.get(max(dfx)) if dfx else None
         rows = conn.execute(
             "SELECT id, payload FROM raw_activities WHERE source='ws_api'"
         ).fetchall()
@@ -392,7 +416,7 @@ def renormalize() -> None:
                 db.upsert_trade(conn, t)
                 n_trades += 1
                 continue
-            inc = normalize_income(payload)
+            inc = normalize_income(payload, daily_fx=dfx, fallback_rate=fallback_rate)
             if inc:
                 inc["raw_id"] = r["id"]
                 db.upsert_income(conn, inc)

@@ -1,14 +1,16 @@
 """Estimate the hidden FX conversion drag on USD-listing trades.
 
-Wealthsimple CAD accounts convert implicitly on every USD-listing trade: the
-activity feed reports the CAD amount with the conversion (mid rate + ~1.5%
-fee) already baked in, and emits no separate FX event. Realized P&L therefore
-already includes the fee — this module only quantifies what it cost.
+Wealthsimple CAD-only accounts convert implicitly on every USD-listing
+trade: the activity feed reports the CAD amount with the conversion (mid
+rate + ~1.5% fee) already baked in, and emits no separate FX event. Realized
+P&L therefore already includes the fee — this module only quantifies what
+it cost.
 
 Hybrid model:
-  - modeled (headline): fee_rate applied to all USD-listing volume —
-    gross_amount * fee_rate / (1 + fee_rate), since the stored amount
-    already contains the fee. Deterministic, no market-data noise.
+  - modeled (headline): fee_rate applied to all USD-listing volume that WS
+    actually converted — gross_amount * fee_rate / (1 + fee_rate), since
+    the stored amount already contains the fee. Deterministic, no
+    market-data noise.
   - empirical (diagnostic): per trade, implied applied rate = trade price /
     listing close (hourly bar at execution when cached, else same-day daily
     close), compared to the USDCAD mid. Validates the fee_rate assumption.
@@ -16,8 +18,12 @@ Hybrid model:
     hourly-matched subset is the trustworthy one. |premium| > 10% is a
     ticker-collision/split artifact and is excluded from aggregates.
 
-USD-listing detection uses the QUOTE currency cached in prices (never the
-trade currency, which is always the account currency CAD).
+USD-listing detection uses the QUOTE currency cached in prices, never the
+trade's own currency. But since the 2026-07-01 CAD/USD hybrid-account
+switch, `trades.currency` is no longer always CAD: USD-currency trades
+(`fx_rate IS NULL`) settle natively in USD with NO implicit WS conversion,
+so they get no modeled fee here — only `currency == 'CAD'` rows (and CAD
+option premiums) ever had the fee baked in.
 """
 
 from __future__ import annotations
@@ -58,17 +64,20 @@ def _hourly_close(conn, symbol: str, ts: str) -> float | None:
 
 def per_trade_costs(conn: sqlite3.Connection,
                     fee_rate: float = DEFAULT_FEE_RATE) -> dict:
-    """trade_id -> modeled embedded FX cost (CAD); only USD-listing trades.
+    """trade_id -> modeled embedded FX cost (CAD); only USD-listing trades
+    that WS actually converted (currency == 'CAD').
 
     Same model and scope as compute()'s headline figure, surfaced per trade
     for display. The cost is embedded in the reported CAD amount and already
-    inside realized P&L — informational, never subtract it again.
+    inside realized P&L — informational, never subtract it again. Native
+    USD-currency trades (post-hybrid) paid no such fee, so they're excluded.
     """
     usd = _usd_symbols(conn)
     factor = fee_rate / (1 + fee_rate)
     return {r["id"]: round(r["gross_amount"] * factor, 2)
-            for r in conn.execute("SELECT id, symbol, gross_amount FROM trades")
-            if r["symbol"] in usd}
+            for r in conn.execute(
+                "SELECT id, symbol, currency, gross_amount FROM trades")
+            if r["symbol"] in usd and r["currency"] == "CAD"}
 
 
 def compute(conn: sqlite3.Connection,
@@ -91,6 +100,11 @@ def compute(conn: sqlite3.Connection,
     estimates: list[dict] = []
     for r in conn.execute("SELECT * FROM trades ORDER BY executed_at"):
         if r["symbol"] not in usd:
+            continue
+        if r["currency"] != "CAD":
+            # Native USD settlement (post-hybrid, fx_rate NULL) — WS never
+            # converted this trade, so there's no embedded fee to model or
+            # diagnose.
             continue
         trade_volume += r["gross_amount"]
         modeled += r["gross_amount"] * factor
@@ -116,7 +130,7 @@ def compute(conn: sqlite3.Connection,
     n_options = 0
     for r in conn.execute(
             "SELECT * FROM option_trades WHERE action IN ('BUY','SELL')"):
-        if r["underlying"] in usd:
+        if r["underlying"] in usd and r["currency"] == "CAD":
             option_volume += r["premium"]
             modeled += r["premium"] * factor
             n_options += 1
