@@ -3,7 +3,9 @@
 A self-hosted trade journal + analytics + MCP server for Wealthsimple
 self-directed accounts. Everything flows through one SQLite database, so each
 layer is independently replaceable. 
+
 ** THIS IS A WORK IN PROGRESS, THERE MAY BE INCONSISTENCIES. DATA DISPLAYED CAN BE USED AS REFERENCE DATA BUT SHOULD NOT BE USED FOR ANYTHING LEGALLY BINDING (T1, T4 ETC) **
+
 ** Feel free to add anything where you see fit. Currently, the biggest gap I've faced is separating multiple portfolios (Registered vs Unregistered, WS Managed Portfolios) **
 
 ```
